@@ -2,6 +2,7 @@ import { DeleteMessageCommand, ReceiveMessageCommand, SQSClient, SendMessageComm
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { incrementMetric } from '../observability/metrics';
+import { resumirErroParaLog } from '../observability/error-summary';
 
 type QueueMessage = {
   messageId?: string;
@@ -29,6 +30,9 @@ export class ConsumidorDeTransacoes implements OnModuleInit, OnModuleDestroy {
     if (!this.queueUrl) {
       this.logger.warn('SQS_TRANSACTIONS_QUEUE_URL is unset; transaction consumer is disabled');
       return;
+    }
+    if (!this.deadLetterQueueUrl) {
+      throw new Error('SQS_TRANSACTIONS_DLQ_URL is required when the transaction consumer is enabled');
     }
     this.loop = this.consumirMensagens();
   }
@@ -68,7 +72,7 @@ export class ConsumidorDeTransacoes implements OnModuleInit, OnModuleDestroy {
           await this.processarMensagem(message);
         }
       } catch (error) {
-        this.logger.error(JSON.stringify({ event: 'sqs_receive_failed', correlationId: null, messageId: null, error: error instanceof Error ? error.message : 'unknown' }));
+        this.logger.error(JSON.stringify({ event: 'sqs_receive_failed', correlationId: null, messageId: null, ...resumirErroParaLog(error) }));
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
@@ -124,7 +128,7 @@ export class ConsumidorDeTransacoes implements OnModuleInit, OnModuleDestroy {
         await this.encaminharParaDlq(message, 'invalid_envelope');
         return;
       }
-      this.logger.warn(JSON.stringify({ event: 'sqs_wager_retry', correlationId: envelope?.correlationId ?? null, messageId: envelope?.messageId ?? brokerId, error: error instanceof Error ? error.message : 'unknown' }));
+      this.logger.warn(JSON.stringify({ event: 'sqs_wager_retry', correlationId: envelope?.correlationId ?? null, messageId: envelope?.messageId ?? brokerId, ...resumirErroParaLog(error) }));
       incrementMetric('sqs_retries_total');
       await this.reagendarMensagem(message, Math.max(1, Number(message.Attributes?.ApproximateReceiveCount ?? 1)));
     }
@@ -151,4 +155,5 @@ export class ConsumidorDeTransacoes implements OnModuleInit, OnModuleDestroy {
     await this.confirmarProcessamento(message.ReceiptHandle);
     this.logger.error(JSON.stringify({ event: 'sqs_wager_dead_lettered', correlationId: null, messageId: message.MessageId ?? null, reason }));
   }
+
 }

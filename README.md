@@ -57,17 +57,18 @@ docker compose up -d postgres
 bun run test:unit
 ```
 
-Os testes de `Money` verificam precisão decimal, entradas inválidas, moedas diferentes e prevenção de saldo negativo.
+Os testes de `Money` verificam precisão decimal, entradas inválidas, moedas diferentes e prevenção de saldo negativo. O contrato é exercitado em Bun e Node.js.
 
 ### Integração e concorrência
 
 Os testes usam um PostgreSQL descartável e sobem três processos da API. Eles cobrem 50 envios idênticos em paralelo, duas apostas de `80.00` disputando saldo `100.00`, carteiras independentes, replay idempotente, conflito de payload e `LOSS` sem movimento no saldo.
 
-Inicie o PostgreSQL e configure a URL do banco de teste no PowerShell:
+Os testes de integração também verificam paginação do ledger, resolução de referência fora de ordem e publisher contra PostgreSQL e LocalStack. Inicie os dois serviços e configure as URLs descartáveis no PowerShell:
 
 ```powershell
-docker compose up -d postgres
+docker compose up -d postgres localstack
 $env:TEST_DATABASE_URL = "postgresql://wager:wager@localhost:5432/wagering"
+$env:SQS_ENDPOINT_URL = "http://localhost:4566"
 bun run test:integration
 ```
 
@@ -130,22 +131,36 @@ Mais detalhes dos contratos e códigos de resposta: [docs/API.md](docs/API.md).
 
 ```text
 src/
+  application/            Coordenação transacional de apostas
   domain/                 Money e regras monetárias
   migrations/             Schema PostgreSQL versionado
-  messaging/              Publisher da outbox para SQS
+  messaging/              Publisher, consumidor SQS e worker de referências
   financial.controller.ts API de carteiras, ledger e operações
   health.controller.ts    Health checks
   app.module.ts           Módulo NestJS
   main.ts                 Inicialização da aplicação
 tests/
-  money.bun.test.mjs      Testes unitários executados por Bun
-  integration/            Testes PostgreSQL e concorrência multiprocesso
+  money.bun.test.mjs      Money sob Bun
+  money.test.cjs          Money sob Node.js
+  transaction-consumer.test.cjs Testes do consumidor com SQS simulado
+  outbox-publisher.test.cjs Testes do publisher com SQS/PostgreSQL simulados
+  integration/            PostgreSQL, LocalStack e concorrência multiprocesso
+benchmarks/
+  outbox-publisher.cjs    Comparação real com PostgreSQL descartável e LocalStack
 ```
+
+## Testes e benchmark da outbox
+
+Execute `npm.cmd run test:node` para os testes Node.js de Money e do publisher com adaptadores simulados. Eles não medem desempenho real nem substituem integração.
+
+O benchmark compara o publisher sequencial anterior com o publisher em lotes usando um banco PostgreSQL descartável já migrado, sem backlog pendente, e LocalStack. No PowerShell, configure `ALLOW_DISPOSABLE_DB=YES`, `BENCH_DATABASE_URL` e `SQS_ENDPOINT_URL=http://localhost:4566`; então execute `npm.cmd run benchmark:outbox`. `BENCH_EVENTS` controla a quantidade (padrão: 200). A saída é marcada `MEDIDO_REAL_POSTGRESQL_LOCALSTACK`; não rode contra um banco com dados que queira preservar. O benchmark cria filas FIFO temporárias e remove os registros e filas ao terminar. Consulte [benchmarks/RESULTS.md](benchmarks/RESULTS.md) para a última medição real reproduzível.
 
 ## Limitações conhecidas
 
-- A suíte existente cobre dinheiro e concorrência HTTP, mas ainda faltam cenários automatizados para SQS/inbox, publisher concorrente, DLQ, scheduler e recuperação após reinício.
+- Os testes cobrem regras financeiras em múltiplos processos, inbox/redelivery após falha injetada no ACK, encaminhamento manual à DLQ e retry de visibilidade no LocalStack, referências fora de ordem, paginação do ledger e publisher real. Ainda faltam indisponibilidade real de rede/SQS, queda abrupta do processo com reinício e redrive automático após o limite de recebimentos.
+- Esta aplicação publica eventos, mas não inclui consumidores downstream. Cada consumidor precisa deduplicar duravelmente por `eventId` numa inbox própria, gravada na mesma transação que seus efeitos. O FIFO do SQS sozinho não oferece deduplicação durável.
 - Os contadores de replay, retry de SQS e conflito de lock são locais a cada processo; os demais gauges são calculados com dados persistidos no PostgreSQL/SQS.
+- O consumer SQS processa sequencialmente as mensagens recebidas; a vazão ainda não foi medida.
 - Autenticação OIDC não está configurada. O desafio permite deixá-la como ponto de extensão; antes de produção, associe identidade e permissões do provedor a um IdP externo.
 
 Esses limites e as decisões de arquitetura estão detalhados em [ARCHITECTURE.md](ARCHITECTURE.md).

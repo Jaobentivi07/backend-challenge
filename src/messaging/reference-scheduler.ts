@@ -3,6 +3,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { randomUUID } from 'node:crypto';
 import { Money } from '../domain/money';
 import { incrementMetric } from '../observability/metrics';
+import { resumirErroParaLog } from '../observability/error-summary';
 
 type Row = Record<string, unknown>;
 
@@ -43,7 +44,7 @@ export class AgendadorDeReferencias implements OnModuleInit, OnModuleDestroy {
         });
         if (!worked) return;
       } catch (error) {
-        this.logger.error(JSON.stringify({ event: 'pending_reference_retry_failed', correlationId: null, messageId: null, transactionId: null, error: error instanceof Error ? error.message : 'unknown' }));
+        this.logger.error(JSON.stringify({ event: 'pending_reference_retry_failed', correlationId: null, messageId: null, transactionId: null, ...resumirErroParaLog(error) }));
         return;
       }
     }

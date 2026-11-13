@@ -1,12 +1,21 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { MikroORM } from '@mikro-orm/postgresql';
+import {
+  CreateQueueCommand,
+  DeleteMessageCommand,
+  DeleteQueueCommand,
+  ReceiveMessageCommand,
+  SendMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 
 const ports = [3311, 3312, 3313];
 const children = [];
 const urls = ports.map((port) => `http://127.0.0.1:${port}`);
+const { ConsumidorDeTransacoes } = require('../../dist/src/messaging/transaction-consumer.js');
 
 async function startServer(port) {
   const childEnv = { ...process.env, PORT: String(port) };
@@ -97,8 +106,8 @@ afterAll(async () => {
   }));
 });
 
-describe('PostgreSQL integration and multi-process concurrency', () => {
-  test('50 parallel copies across 3 app processes create exactly one debit', async () => {
+describe('Integração PostgreSQL e concorrência entre processos', () => {
+  test('50 envios simultâneos em 3 processos geram um único débito', async () => {
     const wallet = await createWallet();
     const payload = wager(wallet, { externalId: randomUUID(), amount: '25.00' });
     const key = `integration:${payload.externalTransactionId}`;
@@ -118,7 +127,7 @@ describe('PostgreSQL integration and multi-process concurrency', () => {
     expect(reconciliation.body.difference.amount).toBe('0.00');
   }, 30_000);
 
-  test('two concurrent 80.00 bets against 100.00 yield one debit and no negative balance', async () => {
+  test('duas apostas simultâneas de 80.00 contra saldo 100.00 não deixam saldo negativo', async () => {
     const wallet = await createWallet();
     const first = wager(wallet, { externalId: randomUUID(), amount: '80.00' });
     const second = wager(wallet, { externalId: randomUUID(), amount: '80.00' });
@@ -137,7 +146,7 @@ describe('PostgreSQL integration and multi-process concurrency', () => {
     expect((await request(1, `/wallets/${wallet.id}/reconciliation`, { method: 'POST', body: '{}' })).body.consistent).toBe(true);
   }, 20_000);
 
-  test('wallets are processed independently and idempotent replay returns its original balance snapshot', async () => {
+  test('carteiras independentes e replay idempotente preservam o saldo original', async () => {
     const [left, right] = await Promise.all([createWallet(0), createWallet(1)]);
     const leftBet = wager(left, { externalId: randomUUID(), amount: '80.00' });
     const rightBet = wager(right, { externalId: randomUUID(), amount: '80.00' });
@@ -163,7 +172,7 @@ describe('PostgreSQL integration and multi-process concurrency', () => {
     expect((await request(2, `/wallets/${left.id}`)).body.balance.amount).toBe('5.00');
   }, 20_000);
 
-  test('LOSS with zero amount records an outcome without changing balance or ledger', async () => {
+  test('LOSS com valor zero registra o resultado sem alterar saldo ou ledger', async () => {
     const wallet = await createWallet();
     const loss = wager(wallet, { externalId: randomUUID(), amount: '0.00', kind: 'LOSS' });
     const result = await submit(0, `integration:${loss.externalTransactionId}`, loss);
@@ -175,4 +184,184 @@ describe('PostgreSQL integration and multi-process concurrency', () => {
     expect(ledger.body.items[0].direction).toBe('CREDIT');
     expect((await request(2, `/wallets/${wallet.id}/reconciliation`, { method: 'POST', body: '{}' })).body.consistent).toBe(true);
   }, 20_000);
+
+  test('paginação do ledger retorna as próximas linhas sem repetir lançamentos', async () => {
+    const wallet = await createWallet();
+    const bet = wager(wallet, { externalId: randomUUID(), amount: '10.00' });
+    await submit(0, `integration:${bet.externalTransactionId}`, bet);
+
+    const firstPage = await request(0, `/wallets/${wallet.id}/ledger?limit=1`);
+    expect(firstPage.statusCode).toBe(200);
+    expect(firstPage.body.items).toHaveLength(1);
+    expect(firstPage.body.nextCursor).toBeTruthy();
+
+    const secondPage = await request(1, `/wallets/${wallet.id}/ledger?limit=1&cursor=${encodeURIComponent(firstPage.body.nextCursor)}`);
+    expect(secondPage.statusCode).toBe(200);
+    expect(secondPage.body.items).toHaveLength(1);
+    expect(secondPage.body.items[0].id).not.toBe(firstPage.body.items[0].id);
+    expect(secondPage.body.nextCursor).toBeNull();
+  }, 20_000);
+
+  test('WIN pendente é resolvido quando a aposta referenciada chega depois', async () => {
+    const wallet = await createWallet();
+    const externalBetId = randomUUID();
+    const win = wager(wallet, { externalId: randomUUID(), amount: '15.00', kind: 'WIN', reference: externalBetId });
+    const pending = await submit(0, `integration:${win.externalTransactionId}`, win);
+    expect(pending.statusCode).toBe(202);
+    expect(pending.body.status).toBe('PENDING_REFERENCE');
+
+    const bet = wager(wallet, { externalId: externalBetId, amount: '5.00' });
+    const processedBet = await submit(1, `integration:${bet.externalTransactionId}`, bet);
+    expect(processedBet.statusCode).toBe(200);
+
+    let resolved;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      resolved = await request(2, `/wagering/transactions/${pending.body.transactionId}`);
+      if (resolved.body.status === 'PROCESSED') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(resolved.body.status).toBe('PROCESSED');
+    expect((await request(0, `/wallets/${wallet.id}/reconciliation`, { method: 'POST', body: '{}' })).body.consistent).toBe(true);
+  }, 20_000);
+
+  test('inbox confirma a mensagem SQS junto da aposta e deduplica o reenvio', async () => {
+    const wallet = await createWallet();
+    const aposta = wager(wallet, { externalId: randomUUID(), amount: '12.00' });
+    const chaveDeIdempotencia = `integration:${aposta.externalTransactionId}`;
+    const envelope = {
+      messageId: randomUUID(),
+      type: 'WagerTransactionRequested',
+      data: { ...aposta, idempotencyKey: chaveDeIdempotencia },
+    };
+    const hashDoEnvelope = createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+    const opcoesDaMensagem = {
+      method: 'POST',
+      headers: {
+        'Idempotency-Key': chaveDeIdempotencia,
+        'x-sqs-message-id': envelope.messageId,
+        'x-sqs-payload-hash': hashDoEnvelope,
+      },
+      body: JSON.stringify(envelope.data),
+    };
+
+    const primeiraResposta = await request(0, '/wagering/transactions', opcoesDaMensagem);
+    const reenvio = await request(1, '/wagering/transactions', opcoesDaMensagem);
+    expect(primeiraResposta.statusCode).toBe(200);
+    expect(reenvio.statusCode).toBe(200);
+    expect(reenvio.body.status).toBe('DUPLICATE_MESSAGE');
+
+    const ormDeVerificacao = await MikroORM.init((await import('../../dist/mikro-orm.config.js')).default);
+    try {
+      const [registroDaInbox] = await ormDeVerificacao.em.getConnection().execute(
+        'select processed_at from inbox_message where consumer_name=? and message_id=?',
+        ['wager-transactions', envelope.messageId],
+      );
+      expect(registroDaInbox.processed_at).not.toBeNull();
+    } finally {
+      await ormDeVerificacao.close(true);
+    }
+    const carteiraFinal = await request(2, `/wallets/${wallet.id}`);
+    expect(carteiraFinal.body.balance.amount).toBe('88.00');
+  }, 20_000);
+
+  test('redelivery após falha no ACK não repete o débito financeiro', async () => {
+    const endpointSqs = process.env.SQS_ENDPOINT_URL;
+    if (!endpointSqs) throw new Error('Defina SQS_ENDPOINT_URL para testar redelivery com LocalStack.');
+    const configuracaoSqs = {
+      region: process.env.SQS_REGION ?? 'us-east-1',
+      endpoint: endpointSqs,
+      credentials: {
+        accessKeyId: process.env.SQS_ACCESS_KEY ?? 'test',
+        secretAccessKey: process.env.SQS_SECRET_KEY ?? 'test',
+      },
+    };
+    const clienteSqsDeTeste = new SQSClient(configuracaoSqs);
+    const envAnterior = {
+      porta: process.env.PORT,
+      filaPrincipal: process.env.SQS_TRANSACTIONS_QUEUE_URL,
+      filaDeErros: process.env.SQS_TRANSACTIONS_DLQ_URL,
+    };
+    const sufixoDaFila = randomUUID().slice(0, 8);
+    let urlDaFilaPrincipal;
+    let urlDaFilaDeErros;
+    let consumidor;
+    try {
+      const filaPrincipalCriada = await clienteSqsDeTeste.send(new CreateQueueCommand({
+        QueueName: `ack-retry-${sufixoDaFila}.fifo`,
+        Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false' },
+      }));
+      const filaDeErrosCriada = await clienteSqsDeTeste.send(new CreateQueueCommand({
+        QueueName: `ack-retry-dlq-${sufixoDaFila}.fifo`,
+        Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false' },
+      }));
+      urlDaFilaPrincipal = `${endpointSqs.replace(/\/$/, '')}${new URL(filaPrincipalCriada.QueueUrl).pathname}`;
+      urlDaFilaDeErros = `${endpointSqs.replace(/\/$/, '')}${new URL(filaDeErrosCriada.QueueUrl).pathname}`;
+      process.env.PORT = '3311';
+      process.env.SQS_TRANSACTIONS_QUEUE_URL = urlDaFilaPrincipal;
+      process.env.SQS_TRANSACTIONS_DLQ_URL = urlDaFilaDeErros;
+
+      const carteira = await createWallet();
+      const aposta = wager(carteira, { externalId: randomUUID(), amount: '12.00' });
+      const envelope = {
+        messageId: randomUUID(),
+        type: 'WagerTransactionRequested',
+        data: { ...aposta, idempotencyKey: `integration:${aposta.externalTransactionId}` },
+      };
+      consumidor = new ConsumidorDeTransacoes();
+      await clienteSqsDeTeste.send(new SendMessageCommand({
+        QueueUrl: urlDaFilaPrincipal,
+        MessageBody: JSON.stringify(envelope),
+        MessageGroupId: carteira.id,
+        MessageDeduplicationId: envelope.messageId,
+      }));
+
+      const receberAtePrazo = async () => {
+        const prazoFinal = Date.now() + 8_000;
+        while (Date.now() < prazoFinal) {
+          const recebidas = await clienteSqsDeTeste.send(new ReceiveMessageCommand({
+            QueueUrl: urlDaFilaPrincipal,
+            MaxNumberOfMessages: 1,
+            WaitTimeSeconds: 1,
+            VisibilityTimeout: 5,
+            MessageSystemAttributeNames: ['ApproximateReceiveCount'],
+          }));
+          if (recebidas.Messages?.[0]) return recebidas.Messages[0];
+        }
+        throw new Error('Tempo limite aguardando redelivery da mensagem');
+      };
+
+      const primeiraEntrega = await receberAtePrazo();
+      const enviarComandoSqs = consumidor.client.send.bind(consumidor.client);
+      let falharPrimeiroAck = true;
+      consumidor.client.send = (comando) => {
+        if (comando instanceof DeleteMessageCommand && falharPrimeiroAck) {
+          falharPrimeiroAck = false;
+          return Promise.reject(new Error('falha de ACK injetada após o commit'));
+        }
+        return enviarComandoSqs(comando);
+      };
+      await consumidor.processarMensagem(primeiraEntrega);
+      expect((await request(0, `/wallets/${carteira.id}`)).body.balance.amount).toBe('88.00');
+
+      const segundaEntrega = await receberAtePrazo();
+      expect(segundaEntrega.Attributes.ApproximateReceiveCount).toBe('2');
+      await consumidor.processarMensagem(segundaEntrega);
+
+      const carteiraDepoisDoRedelivery = await request(1, `/wallets/${carteira.id}`);
+      expect(carteiraDepoisDoRedelivery.body.balance.amount).toBe('88.00');
+      expect(await request(2, `/wallets/${carteira.id}/reconciliation`, { method: 'POST', body: '{}' }).then(({ body }) => body.consistent)).toBe(true);
+    } finally {
+      await consumidor?.onModuleDestroy();
+      if (urlDaFilaPrincipal) await clienteSqsDeTeste.send(new DeleteQueueCommand({ QueueUrl: urlDaFilaPrincipal })).catch(() => {});
+      if (urlDaFilaDeErros) await clienteSqsDeTeste.send(new DeleteQueueCommand({ QueueUrl: urlDaFilaDeErros })).catch(() => {});
+      clienteSqsDeTeste.destroy();
+      if (envAnterior.porta === undefined) delete process.env.PORT;
+      else process.env.PORT = envAnterior.porta;
+      if (envAnterior.filaPrincipal === undefined) delete process.env.SQS_TRANSACTIONS_QUEUE_URL;
+      else process.env.SQS_TRANSACTIONS_QUEUE_URL = envAnterior.filaPrincipal;
+      if (envAnterior.filaDeErros === undefined) delete process.env.SQS_TRANSACTIONS_DLQ_URL;
+      else process.env.SQS_TRANSACTIONS_DLQ_URL = envAnterior.filaDeErros;
+    }
+  }, 30_000);
 });

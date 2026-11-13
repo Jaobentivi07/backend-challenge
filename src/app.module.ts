@@ -6,10 +6,11 @@ import { ControladorFinanceiro } from './financial.controller';
 import { PublicadorDaOutbox } from './messaging/outbox-publisher';
 import { ConsumidorDeTransacoes } from './messaging/transaction-consumer';
 import { AgendadorDeReferencias } from './messaging/reference-scheduler';
+import { ProcessadorDeTransacoesFinanceiras } from './application/processador-de-transacoes-financeiras';
 
 @Module({
   imports: [MikroOrmModule.forRoot({ ...config, registerRequestContext: false })],
   controllers: [HealthController, ControladorFinanceiro],
-  providers: [PublicadorDaOutbox, ConsumidorDeTransacoes, AgendadorDeReferencias],
+  providers: [PublicadorDaOutbox, ConsumidorDeTransacoes, AgendadorDeReferencias, ProcessadorDeTransacoesFinanceiras],
 })
 export class AppModule {}

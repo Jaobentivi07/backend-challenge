@@ -6,7 +6,7 @@ Decimal.set({ precision: 40 });
 
 export interface MoneyProps { amount: string; currency: string }
 
-/** Exact, immutable monetary value. Inputs are deliberately lexically strict. */
+/** Valor monetário imutável e exato; aceita somente strings decimais válidas. */
 export class Money {
   private constructor(private readonly value: Decimal, public readonly currency: string) {}
 

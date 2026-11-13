@@ -8,7 +8,7 @@ O README do desafio continua sendo a especificação original. Este documento de
 
 `GET /wallets/:walletId` retorna o saldo e a versão da carteira.
 
-`GET /wallets/:walletId/ledger?limit=50&cursor=...` retorna os lançamentos mais recentes primeiro. O cursor opaco preserva a precisão temporal do PostgreSQL e segue a ordenação `(created_at, id)`; o limite máximo é 100.
+`GET /wallets/:walletId/ledger?limit=50&cursor=...` retorna os lançamentos mais recentes primeiro. O cursor opaco preserva a precisão temporal do PostgreSQL e segue a ordenação `(created_at, id)`; o limite máximo é 100. A suíte de integração cobre a navegação entre páginas.
 
 `POST /wallets/:walletId/reconciliation` compara o saldo persistido com a soma exata e assinada do ledger. Retorna a diferença e não altera a carteira.
 
@@ -61,8 +61,10 @@ Defina `MessageGroupId` com o ID da carteira para preservar a ordem por carteira
 
 O consumidor grava a mensagem na inbox dentro da mesma transação PostgreSQL da operação financeira e só remove a mensagem do SQS após o commit. Reentregas após o commit são deduplicadas por `(consumer_name, message_id)`. Mensagens inválidas são copiadas para `wager-transactions-dlq.fifo`; falhas transitórias usam backoff exponencial e a política de redrive configurada no SQS.
 
+Esta aplicação não contém consumidores da fila de eventos `wager-events.fifo`. Cada consumidor downstream precisa manter sua própria inbox de eventos, com `eventId` único e persistido na mesma transação dos efeitos que aplica. A deduplicação FIFO do SQS e a inbox de requisições de apostas não substituem essa garantia durável.
+
 O agendador reprocessa registros `PENDING_REFERENCE` com backoff exponencial, até 10 tentativas e TTL de 24 horas. Ao atingir primeiro um desses limites, rejeita a transação com `REFERENCE_NOT_FOUND` e grava um evento de rejeição.
 
 ## Validação e pendências
 
-A compilação Docker e os endpoints de liveness/readiness já foram verificados anteriormente. Ainda faltam testes de integração para inbox/reentrega do SQS, retries/DLQ, publishers concorrentes, resolução pelo agendador e recuperação após falhas. OIDC não foi implementado porque autenticação é opcional no desafio; antes de produção, configure um provedor de identidade externo.
+A compilação Docker, endpoints de liveness/readiness e integrações de concorrência da outbox foram verificados. Ainda faltam testes reais para inbox/reentrega de requisições, retries/DLQ, falhas de rede e recuperação após queda abrupta. OIDC não foi implementado porque autenticação é opcional no desafio; antes de produção, configure um provedor de identidade externo.

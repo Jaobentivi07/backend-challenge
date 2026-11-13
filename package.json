@@ -11,6 +11,7 @@
     "test:node": "node --test tests/*.test.cjs",
     "test:integration": "bun run build && bun test tests/integration",
     "test:concurrency": "bun run build && bun test tests/integration/concurrency.test.js",
+    "benchmark:outbox": "npm run build && node benchmarks/outbox-publisher.cjs",
     "migration:up": "bun run build && bun dist/src/migrate.js",
     "migration:down": "bun run build && bun dist/src/migrate-down.js"
   },

@@ -8,17 +8,20 @@
 - O banco impõe saldo não negativo, uma carteira por jogador/moeda, idempotência única por provedor, um lançamento por transação/carteira e imutabilidade do ledger. Triggers deferred verificam no commit a correspondência transaction↔ledger e saldo↔ledger.
 - A resposta da operação idempotente mantém o saldo observado no veredito em `result_balance`, sem recalculá-lo em replays posteriores.
 - A API inclui criação/consulta de carteira, submissão de wager, consulta de transação, ledger paginado e reconciliação.
+- `ControladorFinanceiro` valida e traduz o contrato HTTP; `ProcessadorDeTransacoesFinanceiras` coordena a transação, idempotência, saldo, ledger, inbox e outbox. Os campos definidos pelo desafio, pelo PostgreSQL e pelo SQS mantêm seus nomes de integração.
 - O consumer FIFO roteia mensagens para o mesmo handler HTTP interno. `messageId` e hash entram no header interno; a inbox, o wager e os efeitos financeiros são commitados juntos. O ack ocorre após a resposta de commit.
 - Mensagens malformadas são enviadas à DLQ; falhas transitórias têm visibility timeout exponencial e a fila aplica redrive após cinco recebimentos. Shutdown gracioso espera o processamento ativo ou devolve mensagens à fila.
 - Um scheduler com `FOR UPDATE SKIP LOCKED` reavalia referências pendentes. Usa backoff exponencial, até 10 tentativas, limitado a 300 segundos por intervalo, e TTL de 24 horas; o que vencer primeiro leva a rejeição auditável `REFERENCE_NOT_FOUND`.
-- O publisher da outbox usa lease de 30 segundos, `SKIP LOCKED`, backoff, FIFO por carteira e envelope versionado com eventId/correlationId/causationId.
+- O publisher drena até 40 eventos por rodada, limita os lotes a dez mensagens e 1 MiB, e executa no máximo quatro chamadas SQS simultâneas por processo. Usa lease de 30 segundos, `SKIP LOCKED`, uma confirmação/retry SQL em lote por rodada e FIFO por carteira; o `eventId` permanece estável em reenvios.
 - `/health/metrics` expõe métricas Prometheus. Logs de aplicação são JSON e não carregam valores financeiros.
 
 ## Limitações restantes
 
-- A suíte atual ainda não cobre inbox/redelivery, DLQ, retries de SQS, publishers concorrentes, recuperação após reinício ou referências fora de ordem. Esses cenários precisam de testes de integração contra PostgreSQL e LocalStack.
+- Os testes de integração agora cobrem DLQ manual e retry de visibilidade no LocalStack, além de redelivery após falha injetada no ACK posterior ao commit. Ainda faltam indisponibilidade real de rede/SQS, queda abrupta do processo com reinício e redrive automático após o limite de recebimentos.
+- Este repositório não contém consumidores downstream da fila de eventos. Cada consumidor precisa de uma inbox própria com unicidade por `eventId`, confirmada atomicamente com os efeitos, pois a deduplicação FIFO do SQS tem duração limitada.
 - Métricas de replay, retry SQS e conflitos de lock são contadores em memória por processo; os status, tentativas do scheduler/outbox, latência e lag são lidos do banco. Use Prometheus para coletar cada instância e agregue os contadores localmente.
-- A entrada de fila faz loopback HTTP para reutilizar a rota de wager; worker e API são co-localizados no processo/container. Uma extração futura para um application service permitiria separar o worker sem a chamada HTTP interna.
+- A entrada SQS ainda faz loopback HTTP para reutilizar a rota de wager; worker e API são co-localizados no processo/container. O fluxo de referência pendente continua no scheduler próprio e ainda não usa o novo processador compartilhado.
+- O consumer processa sequencialmente as mensagens de cada recebimento. A vazão desse caminho ainda não foi medida; não há base para aumentar concorrência sem avaliar a ordem FIFO e o limite por carteira.
 - OIDC continua fora do escopo pontuado do desafio. Antes de produção, integrar um IdP e validar a identidade/autorização de cada provedor.
 
 ## Regras de referência
@@ -30,7 +33,7 @@
 
 ## Situação atual e prioridades
 
-Estado em 13/11/2026: migrations 20261112000000 a 20261115000000 aplicam o schema financeiro, inbox/outbox, agendamento de referência, envelope de correlação e triggers deferred. O build da imagem e os health checks foram verificados via Docker Compose. A suíte automatizada não foi executada após estas mudanças; confira a seção de limitações antes de tratar a entrega como validada para produção.
+Estado em 13/11/2026: migrations 20261112000000 a 20261115000000 aplicam o schema financeiro, inbox/outbox, agendamento de referência, envelope de correlação e triggers deferred. Build e testes passaram nesta revisão: 14 testes Node, 3 testes Bun de `Money` e 9 testes de integração com PostgreSQL/LocalStack. Os casos de indisponibilidade real de rede e queda abrupta do processo continuam pendentes. Isso não substitui uma validação em infraestrutura de produção.
 
 Regras já protegidas no schema:
 
