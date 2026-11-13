@@ -1,0 +1,110 @@
+import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { MikroORM } from '@mikro-orm/postgresql';
+import { GetQueueAttributesCommand, SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import { randomUUID } from 'node:crypto';
+
+type OutboxRow = {
+  id: string;
+  aggregate_id: string;
+  event_type: string;
+  payload: unknown;
+  occurred_at: Date | string;
+  attempts: number;
+};
+
+@Injectable()
+export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(OutboxPublisher.name);
+  private readonly queueUrl = process.env.SQS_EVENTS_QUEUE_URL;
+  private readonly client = new SQSClient({
+    region: process.env.SQS_REGION ?? 'us-east-1',
+    endpoint: process.env.SQS_ENDPOINT_URL,
+    credentials: process.env.SQS_ENDPOINT_URL
+      ? { accessKeyId: process.env.SQS_ACCESS_KEY ?? 'test', secretAccessKey: process.env.SQS_SECRET_KEY ?? 'test' }
+      : undefined,
+  });
+  private timer?: NodeJS.Timeout;
+  private publishing = false;
+  private stopping = false;
+
+  constructor(@Inject(MikroORM) private readonly orm: MikroORM) {}
+
+  async checkReady(): Promise<void> {
+    if (!this.queueUrl) throw new Error('SQS_EVENTS_QUEUE_URL is unset');
+    await this.client.send(new GetQueueAttributesCommand({ QueueUrl: this.queueUrl, AttributeNames: ['QueueArn'] }));
+  }
+
+  onModuleInit(): void {
+    if (!this.queueUrl) {
+      this.logger.warn('SQS_EVENTS_QUEUE_URL is unset; outbox publisher is disabled');
+      return;
+    }
+    this.timer = setInterval(() => void this.publishBatch(), 1000);
+    void this.publishBatch();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    this.stopping = true;
+    if (this.timer) clearInterval(this.timer);
+    while (this.publishing) await new Promise((resolve) => setTimeout(resolve, 25));
+    this.client.destroy();
+  }
+
+  private async publishBatch(): Promise<void> {
+    if (this.publishing || this.stopping || !this.queueUrl) return;
+    this.publishing = true;
+    try {
+      const lease = randomUUID();
+      const rows = await this.orm.em.transactional(async (em) => em.getConnection().execute<OutboxRow[]>(`
+        with picked as (
+          select candidate.id from outbox_message candidate
+          where candidate.published_at is null
+            and (candidate.next_attempt_at is null or candidate.next_attempt_at <= now())
+            and (candidate.lease_until is null or candidate.lease_until < now())
+            and not exists (
+              select 1 from outbox_message earlier
+              where earlier.aggregate_id=candidate.aggregate_id
+                and earlier.published_at is null
+                and earlier.seq < candidate.seq
+            )
+          order by candidate.seq
+          limit 25
+          for update skip locked
+        )
+        update outbox_message as event
+        set lease_token = ?, lease_until = now() + interval '30 seconds', attempts = event.attempts + 1
+        from picked where event.id = picked.id
+        returning event.id, event.aggregate_id, event.event_type, event.payload, event.occurred_at, event.attempts
+      `, [lease]));
+
+      for (const event of rows) {
+        try {
+          const body = JSON.stringify({
+            eventId: event.id,
+            eventType: event.event_type,
+            aggregateId: event.aggregate_id,
+            correlationId: event.id,
+            occurredAt: new Date(event.occurred_at).toISOString(),
+            version: 1,
+            data: event.payload,
+          });
+          await this.client.send(new SendMessageCommand({
+            QueueUrl: this.queueUrl,
+            MessageBody: body,
+            MessageGroupId: event.aggregate_id,
+            MessageDeduplicationId: event.id,
+          }));
+          await this.orm.em.getConnection().execute(`update outbox_message set published_at=now(),lease_token=null,lease_until=null where id=? and lease_token=?`, [event.id, lease]);
+        } catch (error) {
+          const delaySeconds = Math.min(300, 2 ** Math.min(Number(event.attempts), 8));
+          await this.orm.em.getConnection().execute(`update outbox_message set next_attempt_at=now()+(? * interval '1 second'),lease_token=null,lease_until=null where id=? and lease_token=?`, [delaySeconds,event.id,lease]);
+          this.logger.warn(`Outbox send failed for event ${event.id}; retry scheduled`);
+        }
+      }
+    } catch (error) {
+      this.logger.error('Outbox batch failed', error instanceof Error ? error.stack : undefined);
+    } finally {
+      this.publishing = false;
+    }
+  }
+}
