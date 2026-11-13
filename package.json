@@ -11,8 +11,8 @@
     "test:node": "node --test tests/*.test.cjs",
     "test:integration": "bun run build && bun test tests/integration",
     "test:concurrency": "bun run build && bun test tests/integration/concurrency.test.js",
-    "migration:up": "bun dist/src/migrate.js",
-    "migration:down": "mikro-orm migration:down"
+    "migration:up": "bun run build && bun dist/src/migrate.js",
+    "migration:down": "bun run build && bun dist/src/migrate-down.js"
   },
   "dependencies": {
     "@mikro-orm/core": "^6.4.16",

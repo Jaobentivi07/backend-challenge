@@ -30,8 +30,39 @@ Queries: `GET /wagering/transactions/:transactionId` and `GET /providers/:provid
 ## Health
 
 - `GET /health/live` reports that the process is running.
-- `GET /health/ready` checks PostgreSQL and the configured SQS events queue.
+- `GET /health/ready` checks PostgreSQL, the SQS events queue and the transactions queue.
+- `GET /health/metrics` returns Prometheus text for transaction statuses, idempotent replays, inbox duplicates, retries, DLQ depth, lock conflicts, outbox lag and processing latency.
 
-## Known implementation gaps
+## SQS transaction input
 
-The SQS events publisher is implemented, but the SQS command consumer and inbox transaction are not. Pending references are persisted and surfaced in the outbox, but there is no scheduler to resolve them. The PostgreSQL multi-process integration suite is present under `tests/integration`, but has not yet been run in this environment. Authentication is not implemented; the challenge allows documenting an external OIDC extension instead of building local credentials.
+Send `WagerTransactionRequested` messages to `wager-transactions.fifo` with a stable `messageId` and `idempotencyKey`:
+
+```json
+{
+  "messageId": "message-123",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-11-13T12:00:00.000Z",
+  "correlationId": "provider-request-123",
+  "data": {
+    "idempotencyKey": "provider-a:transaction-123",
+    "providerId": "provider-a",
+    "externalTransactionId": "transaction-123",
+    "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+    "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+    "roundId": "round-987",
+    "gameId": "fortune-chimp",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}
+```
+
+Set the FIFO `MessageGroupId` to the wallet ID (to preserve wallet order) and `MessageDeduplicationId` to the stable message ID. PostgreSQL locks and constraints remain the correctness boundary; broker ordering is only an optimization.
+
+The consumer routes the payload through the wager handler. It inserts the inbox record in the same PostgreSQL transaction as the financial operation and deletes the SQS message only after the handler commits. Redelivery after commit is deduplicated by `(consumer_name, message_id)`. Malformed messages are copied to `wager-transactions-dlq.fifo`; transient failures use exponential visibility backoff and the configured SQS redrive policy.
+
+`PENDING_REFERENCE` records are retried by the scheduler with exponential backoff, a maximum of 10 attempts, and a 24-hour TTL. The first limit reached rejects the transaction with `REFERENCE_NOT_FOUND` and writes a rejection event.
+
+## Validation status and remaining work
+
+The current Docker build and liveness/readiness endpoints have been checked. The automated integration suite still needs scenarios for SQS inbox/redelivery, retries/DLQ, concurrent publishers, scheduler resolution, and crash recovery. OIDC is intentionally not implemented because authentication is optional in the challenge; use an external IdP before production.

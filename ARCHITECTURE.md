@@ -1,24 +1,25 @@
 # Decisões de arquitetura
 
-## Escopo entregue nesta primeira implementação
+## Escopo implementado
 
 - NestJS com TypeScript estrito, Bun como runtime/package manager, MikroORM 6 e PostgreSQL.
 - `Money` encapsula `decimal.js`; contratos monetários usam strings decimais e a aplicação valida o formato lexical antes de construir o Decimal.
 - Cada escrita financeira executa numa transação PostgreSQL. A linha da carteira é lida com `FOR UPDATE`; o bloqueio é por carteira, permitindo carteiras distintas em paralelo.
-- O banco impõe saldo não negativo, uma carteira por jogador/moeda, idempotência única por provedor, um lançamento por transação/carteira e imutabilidade do ledger.
+- O banco impõe saldo não negativo, uma carteira por jogador/moeda, idempotência única por provedor, um lançamento por transação/carteira e imutabilidade do ledger. Triggers deferred verificam no commit a correspondência transaction↔ledger e saldo↔ledger.
 - A resposta da operação idempotente mantém o saldo observado no veredito em `result_balance`, sem recalculá-lo em replays posteriores.
 - A API inclui criação/consulta de carteira, submissão de wager, consulta de transação, ledger paginado e reconciliação.
+- O consumer FIFO roteia mensagens para o mesmo handler HTTP interno. `messageId` e hash entram no header interno; a inbox, o wager e os efeitos financeiros são commitados juntos. O ack ocorre após a resposta de commit.
+- Mensagens malformadas são enviadas à DLQ; falhas transitórias têm visibility timeout exponencial e a fila aplica redrive após cinco recebimentos. Shutdown gracioso espera o processamento ativo ou devolve mensagens à fila.
+- Um scheduler com `FOR UPDATE SKIP LOCKED` reavalia referências pendentes. Usa backoff exponencial, até 10 tentativas, limitado a 300 segundos por intervalo, e TTL de 24 horas; o que vencer primeiro leva a rejeição auditável `REFERENCE_NOT_FOUND`.
+- O publisher da outbox usa lease de 30 segundos, `SKIP LOCKED`, backoff, FIFO por carteira e envelope versionado com eventId/correlationId/causationId.
+- `/health/metrics` expõe métricas Prometheus. Logs de aplicação são JSON e não carregam valores financeiros.
 
-## Limitações que permanecem
+## Limitações restantes
 
-Este diretório começou apenas com o enunciado. A implementação inicial ainda não fecha o desafio inteiro:
-
-1. SQS de entrada, consumer, inbox no mesmo fluxo financeiro, retries de mensagens e encerramento gracioso ainda não estão conectados. O Compose cria filas FIFO e DLQs com redrive.
-2. O publisher SQS da outbox já reivindica linhas com `FOR UPDATE SKIP LOCKED`, lease e backoff, preserva a ordem por carteira e confirma publicação; ainda faltam métricas/alarme de lag e testes de recuperação/concorrência.
-3. Transações `PENDING_REFERENCE` são registradas, mas falta o worker agendado para reprocessar, aplicar TTL/backoff e rejeitar referências expiradas.
-4. A observabilidade estruturada e as métricas do enunciado ainda precisam ser adicionadas.
-5. Cobertura de integração/concorrência com PostgreSQL e LocalStack ainda precisa ser escrita e executada.
-6. Autenticação foi deixada fora do escopo inicial, como o enunciado permite; antes de produção deve ser integrado um IdP OIDC e aplicado controle de identidade do provedor.
+- A suíte atual ainda não cobre inbox/redelivery, DLQ, retries de SQS, publishers concorrentes, recuperação após reinício ou referências fora de ordem. Esses cenários precisam de testes de integração contra PostgreSQL e LocalStack.
+- Métricas de replay, retry SQS e conflitos de lock são contadores em memória por processo; os status, tentativas do scheduler/outbox, latência e lag são lidos do banco. Use Prometheus para coletar cada instância e agregue os contadores localmente.
+- A entrada de fila faz loopback HTTP para reutilizar a rota de wager; worker e API são co-localizados no processo/container. Uma extração futura para um application service permitiria separar o worker sem a chamada HTTP interna.
+- OIDC continua fora do escopo pontuado do desafio. Antes de produção, integrar um IdP e validar a identidade/autorização de cada provedor.
 
 ## Regras de referência
 
@@ -29,32 +30,17 @@ Este diretório começou apenas com o enunciado. A implementação inicial ainda
 
 ## Situação atual e prioridades
 
-Estado em 12/11/2026: há um scaffold NestJS/MikroORM e uma primeira API com transações SQL, lock por carteira, `Money`, ledger, migrations e gravação de outbox na mesma transação. `baseUrl` foi removido de `tsconfig.json`: não há aliases configurados, e imports relativos resolvem os módulos. O build NestJS passou com `npm.cmd run build`; quatro testes unitários de `Money` passaram com `npm.cmd run test:node`. A suíte de integração/concorrência foi escrita para três processos reais da API contra PostgreSQL, mas não executada pois Bun, Docker e `psql` não estão instalados. O runner exigido pelo enunciado (`bun test`) está configurado em `test:unit`, `test:integration` e `test:concurrency`. O fork comparado abaixo não foi integrado.
+Estado em 13/11/2026: migrations 20261112000000 a 20261115000000 aplicam o schema financeiro, inbox/outbox, agendamento de referência, envelope de correlação e triggers deferred. O build da imagem e os health checks foram verificados via Docker Compose. A suíte automatizada não foi executada após estas mudanças; confira a seção de limitações antes de tratar a entrega como validada para produção.
 
-Pendências, em ordem de risco para as invariantes:
+Regras já protegidas no schema:
 
-### P0 — fechar correção financeira
+### Garantias no PostgreSQL
 
-- Adicionar validação de schema/DTO compartilhada, rejeitar campos desconhecidos e mapear todas as violações de constraint para erros HTTP estáveis.
-- Completar barreiras de schema para identidade/contexto de referência, self-reference, transições válidas e consistência transaction↔ledger↔saldo. Já existem FK composta carteira/player/moeda, FK interna de referência, índice de reversão por tipo e bloqueio de UPDATE/DELETE/TRUNCATE do ledger; ainda não há grants separados nem triggers diferidos que comprovem todos os vínculos no commit.
-- Conferir as regras de referência pendente e prevenir ciclos/self-reference; validar a migration em PostgreSQL real.
-- O snapshot atual salva saldo e estado para replay, mas ainda precisa cobrir todos os campos de resposta e erros de corrida em cenários concorrentes reais.
-- `LOSS` aceita somente `0.00`, sem ledger ou alteração de saldo; essa regra já está no controller e na constraint da migration.
-
-### P1 — recuperação distribuída
-
-- Conectar SQS FIFO e consumer ao mesmo caso de uso HTTP; inserir/confirmar inbox na mesma transação e só dar ack após commit.
-- Implementar retry transitório, DLQ, limites de tentativa, shutdown gracioso e readiness verificando PostgreSQL e SQS.
-- Validar o publisher da outbox contra LocalStack, incluir métricas de lag/tentativa e comprovar crash recovery e concorrência de publishers. O claim ordena a sequência por carteira e não avança enquanto existir evento anterior não publicado.
-- Implementar scheduler para `PENDING_REFERENCE`, com backoff, TTL e rejeição auditável após expiração.
-- Definir envelope de eventos com eventId, correlationId, version e payload serializado de forma estável.
-
-### P2 — comprovação e operação
-
-- Expandir os quatro testes unitários atuais (somente `Money`). A suíte PostgreSQL/multiprocesso foi escrita e cobre 50 duplicatas paralelas, duas apostas concorrentes, carteiras independentes, replay/conflito e LOSS; falta executá-la. Ainda faltam testes reais de SQS/inbox/outbox, publishers concorrentes, recovery e scheduler.
-- Adicionar logs estruturados e métricas obrigatórias; readiness já verifica PostgreSQL e fila de eventos SQS.
-- Gerar `bun.lock` e executar migrations, smoke tests e suíte distribuída em ambiente com Bun/Docker. O build foi validado com Node/npm; o runner Bun já está configurado, mas permanece sem execução neste ambiente.
-- Avaliar integração OIDC como ponto de extensão; autenticação não é pontuada pelo enunciado. O contrato HTTP atual está em `docs/API.md`.
+- FK composta wallet/player/currency, unicidade de wallet por player/currency, idempotência provider/key e identidade externa provider/transaction.
+- Ledger append-only, uma linha por transaction/wallet, aritmética antes/depois, saldo não negativo e reconciliação deferred no commit.
+- Referência de mesmo provider/player/wallet/currency/round, tipo de referência permitido, valor integral em refund/rollback e proteção contra self-reference.
+- Transição terminal de status bloqueada e consistência de cardinalidade/valores entre transaction e ledger.
+- Idempotency payload hash SHA-256 de JSON canônico; `Idempotency-Key` fica fora do hash e precisa coincidir com a chave no envelope SQS.
 
 ## Comparação: fork tcalgarotto/backend-challenge
 

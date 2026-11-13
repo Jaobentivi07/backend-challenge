@@ -4,8 +4,11 @@ services:
     environment:
       SERVICES: sqs
       AWS_DEFAULT_REGION: us-east-1
+      PERSISTENCE: 1
     ports:
       - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
       interval: 5s
@@ -20,6 +23,8 @@ services:
       POSTGRES_PASSWORD: wager
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wager -d wagering"]
       interval: 5s
@@ -35,6 +40,8 @@ services:
       SQS_ACCESS_KEY: test
       SQS_SECRET_KEY: test
       SQS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
+      SQS_TRANSACTIONS_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_TRANSACTIONS_DLQ_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
     ports:
       - "3000:3000"
     depends_on:
@@ -42,10 +49,14 @@ services:
         condition: service_healthy
       localstack:
         condition: service_healthy
-    command: ["sh", "-c", "bun run migration:up && bun run start:prod"]
+    command: ["sh", "-c", "bun dist/src/migrate.js && bun run start:prod"]
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://localhost:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 20s
+
+volumes:
+  localstack_data:
+  postgres_data:

@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nest
 import { MikroORM } from '@mikro-orm/postgresql';
 import { GetQueueAttributesCommand, SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { randomUUID } from 'node:crypto';
+import { incrementMetric } from '../observability/metrics';
 
 type OutboxRow = {
   id: string;
@@ -9,6 +10,8 @@ type OutboxRow = {
   event_type: string;
   payload: unknown;
   occurred_at: Date | string;
+  correlation_id?: string | null;
+  causation_id?: string | null;
   attempts: number;
 };
 
@@ -74,7 +77,7 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
         update outbox_message as event
         set lease_token = ?, lease_until = now() + interval '30 seconds', attempts = event.attempts + 1
         from picked where event.id = picked.id
-        returning event.id, event.aggregate_id, event.event_type, event.payload, event.occurred_at, event.attempts
+        returning event.id, event.aggregate_id, event.event_type, event.payload, event.occurred_at, event.correlation_id, event.causation_id, event.attempts
       `, [lease]));
 
       for (const event of rows) {
@@ -83,7 +86,8 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
             eventId: event.id,
             eventType: event.event_type,
             aggregateId: event.aggregate_id,
-            correlationId: event.id,
+            correlationId: event.correlation_id ?? event.id,
+            ...(event.causation_id ? { causationId: event.causation_id } : {}),
             occurredAt: new Date(event.occurred_at).toISOString(),
             version: 1,
             data: event.payload,
@@ -96,13 +100,14 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
           }));
           await this.orm.em.getConnection().execute(`update outbox_message set published_at=now(),lease_token=null,lease_until=null where id=? and lease_token=?`, [event.id, lease]);
         } catch (error) {
+          incrementMetric('outbox_retries_total');
           const delaySeconds = Math.min(300, 2 ** Math.min(Number(event.attempts), 8));
           await this.orm.em.getConnection().execute(`update outbox_message set next_attempt_at=now()+(? * interval '1 second'),lease_token=null,lease_until=null where id=? and lease_token=?`, [delaySeconds,event.id,lease]);
-          this.logger.warn(`Outbox send failed for event ${event.id}; retry scheduled`);
+          this.logger.warn(JSON.stringify({ event: 'outbox_publish_retry', correlationId: event.id, messageId: null, transactionId: null, walletId: event.aggregate_id, eventId: event.id, error: error instanceof Error ? error.message : 'unknown' }));
         }
       }
     } catch (error) {
-      this.logger.error('Outbox batch failed', error instanceof Error ? error.stack : undefined);
+      this.logger.error(JSON.stringify({ event: 'outbox_batch_failed', correlationId: null, messageId: null, transactionId: null, error: error instanceof Error ? error.message : 'unknown' }));
     } finally {
       this.publishing = false;
     }

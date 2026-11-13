@@ -4,10 +4,12 @@ import config from '../mikro-orm.config';
 import { HealthController } from './health.controller';
 import { FinancialController } from './financial.controller';
 import { OutboxPublisher } from './messaging/outbox-publisher';
+import { TransactionConsumer } from './messaging/transaction-consumer';
+import { ReferenceScheduler } from './messaging/reference-scheduler';
 
 @Module({
   imports: [MikroOrmModule.forRoot({ ...config, registerRequestContext: false })],
   controllers: [HealthController, FinancialController],
-  providers: [OutboxPublisher],
+  providers: [OutboxPublisher, TransactionConsumer, ReferenceScheduler],
 })
 export class AppModule {}

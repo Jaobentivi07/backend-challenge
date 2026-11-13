@@ -12,7 +12,11 @@ O enunciado integral do desafio foi preservado em [docs/CHALLENGE.md](docs/CHALL
 - Idempotência por provedor e chave, com hash do payload e replay do saldo original.
 - Lock PostgreSQL por carteira para serializar alterações concorrentes do mesmo saldo.
 - Ledger append-only, reconciliação de saldo e migrations com constraints financeiras.
-- Outbox transacional com publisher para SQS FIFO, lease, retry com backoff e ordenação por carteira.
+- Outbox transacional com publisher SQS FIFO, lease recuperável, retry com backoff e ordenação por carteira.
+- Consumer SQS FIFO com inbox na transação financeira, deduplicação persistente, retry transitório e DLQ.
+- Worker agendado para referências fora de ordem, com backoff exponencial, limite de 10 tentativas e TTL de 24 horas.
+- Triggers deferred do PostgreSQL que conferem transaction/ledger e saldo/ledger no commit.
+- Logs JSON e métricas operacionais em `/health/metrics`.
 - Docker Compose para PostgreSQL, LocalStack/SQS e API.
 
 ## Requisitos locais
@@ -88,6 +92,7 @@ Os testes aplicam as migrations no banco informado. Use somente um banco descart
 | `GET` | `/providers/:providerId/wagering/transactions/:externalTransactionId` | Consulta pela identidade do provedor |
 | `GET` | `/health/live` | Verifica se o processo está vivo |
 | `GET` | `/health/ready` | Verifica PostgreSQL e a fila de eventos SQS |
+| `GET` | `/health/metrics` | Métricas Prometheus de transações, retries, DLQ, locks, latência e outbox |
 
 Exemplo de criação de carteira:
 
@@ -139,10 +144,8 @@ tests/
 
 ## Limitações conhecidas
 
-- O consumer de operações SQS e o fluxo de inbox atômico ainda não estão implementados.
-- Transações `PENDING_REFERENCE` são registradas, mas ainda falta o scheduler de reprocessamento e expiração.
-- Os testes de integração estão escritos, mas precisam ser executados em um ambiente com Bun e Docker/PostgreSQL.
-- Métricas operacionais completas e testes de crash recovery do publisher ainda faltam.
-- A autenticação externa OIDC não está configurada; o enunciado permite deixá-la como ponto de extensão.
+- A suíte existente cobre dinheiro e concorrência HTTP, mas ainda faltam cenários automatizados para SQS/inbox, publisher concorrente, DLQ, scheduler e recuperação após reinício.
+- Os contadores de replay, retry de SQS e conflito de lock são locais a cada processo; os demais gauges são calculados com dados persistidos no PostgreSQL/SQS.
+- Autenticação OIDC não está configurada. O desafio permite deixá-la como ponto de extensão; antes de produção, associe identidade e permissões do provedor a um IdP externo.
 
 Esses limites e as decisões de arquitetura estão detalhados em [ARCHITECTURE.md](ARCHITECTURE.md).
