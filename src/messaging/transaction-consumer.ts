@@ -11,8 +11,8 @@ type QueueMessage = {
 };
 
 @Injectable()
-export class TransactionConsumer implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(TransactionConsumer.name);
+export class ConsumidorDeTransacoes implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(ConsumidorDeTransacoes.name);
   private readonly client = new SQSClient({
     region: process.env.SQS_REGION ?? 'us-east-1',
     endpoint: process.env.SQS_ENDPOINT_URL,
@@ -30,7 +30,7 @@ export class TransactionConsumer implements OnModuleInit, OnModuleDestroy {
       this.logger.warn('SQS_TRANSACTIONS_QUEUE_URL is unset; transaction consumer is disabled');
       return;
     }
-    this.loop = this.consume();
+    this.loop = this.consumirMensagens();
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -39,18 +39,18 @@ export class TransactionConsumer implements OnModuleInit, OnModuleDestroy {
     this.client.destroy();
   }
 
-  async checkReady(): Promise<void> {
+  async verificarProntidao(): Promise<void> {
     if (!this.queueUrl) throw new Error('SQS_TRANSACTIONS_QUEUE_URL is unset');
     await this.client.send(new GetQueueAttributesCommand({ QueueUrl: this.queueUrl, AttributeNames: ['QueueArn'] }));
   }
 
-  async deadLetterDepth(): Promise<number> {
+  async consultarProfundidadeDaDlq(): Promise<number> {
     if (!this.deadLetterQueueUrl) return 0;
     const result = await this.client.send(new GetQueueAttributesCommand({ QueueUrl: this.deadLetterQueueUrl!, AttributeNames: ['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible'] }));
     return Number(result.Attributes?.ApproximateNumberOfMessages ?? 0) + Number(result.Attributes?.ApproximateNumberOfMessagesNotVisible ?? 0);
   }
 
-  private async consume(): Promise<void> {
+  private async consumirMensagens(): Promise<void> {
     while (!this.stopping) {
       try {
         const result = await this.client.send(new ReceiveMessageCommand({
@@ -65,7 +65,7 @@ export class TransactionConsumer implements OnModuleInit, OnModuleDestroy {
             await this.client.send(new ChangeMessageVisibilityCommand({ QueueUrl: this.queueUrl!, ReceiptHandle: message.ReceiptHandle, VisibilityTimeout: 0 }));
             break;
           }
-          await this.processMessage(message);
+          await this.processarMensagem(message);
         }
       } catch (error) {
         this.logger.error(JSON.stringify({ event: 'sqs_receive_failed', correlationId: null, messageId: null, error: error instanceof Error ? error.message : 'unknown' }));
@@ -74,7 +74,7 @@ export class TransactionConsumer implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async processMessage(message: { Body?: string; MessageId?: string; ReceiptHandle?: string; Attributes?: Record<string, string> }): Promise<void> {
+  private async processarMensagem(message: { Body?: string; MessageId?: string; ReceiptHandle?: string; Attributes?: Record<string, string> }): Promise<void> {
     const receipt = message.ReceiptHandle;
     const brokerId = message.MessageId ?? 'unknown';
     if (!receipt || !message.Body) return;
@@ -102,45 +102,45 @@ export class TransactionConsumer implements OnModuleInit, OnModuleDestroy {
       });
       if (response.status >= 500) {
         incrementMetric('sqs_retries_total');
-        await this.retryLater(message, Math.max(1, Number(message.Attributes?.ApproximateReceiveCount ?? 1)));
+        await this.reagendarMensagem(message, Math.max(1, Number(message.Attributes?.ApproximateReceiveCount ?? 1)));
         return;
       }
       if (response.status === 400) {
         incrementMetric('sqs_dead_lettered_total');
-        await this.moveToDeadLetter(message, 'invalid_request');
+        await this.encaminharParaDlq(message, 'invalid_request');
         return;
       }
       if (response.status < 200 || response.status >= 300) {
         this.logger.warn(JSON.stringify({ event: 'sqs_wager_terminal', correlationId: envelope.correlationId ?? null, messageId, providerId: transaction.providerId ?? null, statusCode: response.status }));
-        await this.acknowledge(receipt);
+        await this.confirmarProcessamento(receipt);
         return;
       }
       const outcome = await response.json() as { transactionId?: string; status?: string };
       this.logger.log(JSON.stringify({ event: 'sqs_wager_committed', correlationId: envelope.correlationId ?? null, messageId, transactionId: outcome.transactionId ?? null, walletId: transaction.walletId ?? null, providerId: transaction.providerId ?? null, status: outcome.status ?? 'duplicate' }));
-      await this.acknowledge(receipt);
+      await this.confirmarProcessamento(receipt);
     } catch (error) {
       if (error instanceof SyntaxError || error instanceof Error && ['INVALID_MESSAGE_ENVELOPE', 'IDEMPOTENCY_KEY_REQUIRED'].includes(error.message)) {
         incrementMetric('sqs_dead_lettered_total');
-        await this.moveToDeadLetter(message, 'invalid_envelope');
+        await this.encaminharParaDlq(message, 'invalid_envelope');
         return;
       }
       this.logger.warn(JSON.stringify({ event: 'sqs_wager_retry', correlationId: envelope?.correlationId ?? null, messageId: envelope?.messageId ?? brokerId, error: error instanceof Error ? error.message : 'unknown' }));
       incrementMetric('sqs_retries_total');
-      await this.retryLater(message, Math.max(1, Number(message.Attributes?.ApproximateReceiveCount ?? 1)));
+      await this.reagendarMensagem(message, Math.max(1, Number(message.Attributes?.ApproximateReceiveCount ?? 1)));
     }
   }
 
-  private async acknowledge(receipt: string): Promise<void> {
+  private async confirmarProcessamento(receipt: string): Promise<void> {
     await this.client.send(new DeleteMessageCommand({ QueueUrl: this.queueUrl!, ReceiptHandle: receipt }));
   }
 
-  private async retryLater(message: { ReceiptHandle?: string; Attributes?: Record<string, string> }, receiveCount: number): Promise<void> {
+  private async reagendarMensagem(message: { ReceiptHandle?: string; Attributes?: Record<string, string> }, receiveCount: number): Promise<void> {
     if (!message.ReceiptHandle) return;
     const delay = Math.min(60, 2 ** Math.min(receiveCount, 6));
     await this.client.send(new ChangeMessageVisibilityCommand({ QueueUrl: this.queueUrl!, ReceiptHandle: message.ReceiptHandle, VisibilityTimeout: delay }));
   }
 
-  private async moveToDeadLetter(message: { Body?: string; ReceiptHandle?: string; MessageId?: string }, reason: string): Promise<void> {
+  private async encaminharParaDlq(message: { Body?: string; ReceiptHandle?: string; MessageId?: string }, reason: string): Promise<void> {
     if (!message.Body || !message.ReceiptHandle) return;
     await this.client.send(new SendMessageCommand({
       QueueUrl: this.deadLetterQueueUrl!,
@@ -148,7 +148,7 @@ export class TransactionConsumer implements OnModuleInit, OnModuleDestroy {
       MessageGroupId: 'invalid-wager-messages',
       MessageDeduplicationId: `${message.MessageId ?? 'unknown'}:${reason}`,
     }));
-    await this.acknowledge(message.ReceiptHandle);
+    await this.confirmarProcessamento(message.ReceiptHandle);
     this.logger.error(JSON.stringify({ event: 'sqs_wager_dead_lettered', correlationId: null, messageId: message.MessageId ?? null, reason }));
   }
 }

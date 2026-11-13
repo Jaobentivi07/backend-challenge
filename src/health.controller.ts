@@ -1,12 +1,12 @@
 import { Controller, Get, Header, Inject } from '@nestjs/common';
 import { MikroORM } from '@mikro-orm/postgresql';
-import { OutboxPublisher } from './messaging/outbox-publisher';
-import { TransactionConsumer } from './messaging/transaction-consumer';
+import { PublicadorDaOutbox } from './messaging/outbox-publisher';
+import { ConsumidorDeTransacoes } from './messaging/transaction-consumer';
 import { metricValue } from './observability/metrics';
 
 @Controller('health')
 export class HealthController {
-  constructor(@Inject(MikroORM) private readonly orm: MikroORM, private readonly outbox: OutboxPublisher, private readonly consumer: TransactionConsumer) {}
+  constructor(@Inject(MikroORM) private readonly orm: MikroORM, private readonly outbox: PublicadorDaOutbox, private readonly consumer: ConsumidorDeTransacoes) {}
 
   @Get('live')
   live(): { status: string } { return { status: 'ok' }; }
@@ -14,8 +14,8 @@ export class HealthController {
   @Get('ready')
   async ready(): Promise<{ status: string }> {
     await this.orm.em.getConnection().execute('select 1');
-    await this.outbox.checkReady();
-    await this.consumer.checkReady();
+    await this.outbox.verificarProntidao();
+    await this.consumer.verificarProntidao();
     return { status: 'ready' };
   }
 
@@ -23,13 +23,13 @@ export class HealthController {
   @Header('content-type', 'text/plain; version=0.0.4; charset=utf-8')
   async metrics(): Promise<string> {
     const conn = this.orm.em.getConnection();
-    const [statuses, retries, lag, latency, deadLetterDepth] = await Promise.all([
+    const [statuses, retries, lag, latency, consultarProfundidadeDaDlq] = await Promise.all([
       conn.execute<Array<{ status: string; count: string }>>('select status,count(*)::text as count from wager_transaction group by status order by status'),
       conn.execute<Array<{ retries: string }>>(`select (coalesce((select sum(reference_attempts) from wager_transaction),0)
         + coalesce((select sum(greatest(attempts-1,0)) from outbox_message),0))::text as retries`),
       conn.execute<Array<{ seconds: string | null }>>(`select greatest(0,extract(epoch from (now()-min(created_at))))::text as seconds from outbox_message where published_at is null`),
       conn.execute<Array<{ milliseconds: string | null }>>(`select coalesce(avg(extract(epoch from (processed_at-created_at))*1000),0)::text as milliseconds from wager_transaction where processed_at is not null`),
-      this.consumer.deadLetterDepth(),
+      this.consumer.consultarProfundidadeDaDlq(),
     ]);
     const lines = [
       '# HELP wager_transactions_total Persisted wager transactions by status.',
@@ -49,7 +49,7 @@ export class HealthController {
       `wager_retries_total ${Number(retries[0]?.retries ?? 0) + metricValue('sqs_retries_total')}`,
       '# HELP wager_messages_in_dlq Current visible and in-flight messages in the wager DLQ.',
       '# TYPE wager_messages_in_dlq gauge',
-      `wager_messages_in_dlq ${deadLetterDepth}`,
+      `wager_messages_in_dlq ${consultarProfundidadeDaDlq}`,
       '# HELP wager_database_lock_conflicts_total PostgreSQL lock conflicts observed by this process.',
       '# TYPE wager_database_lock_conflicts_total counter',
       `wager_database_lock_conflicts_total ${metricValue('database_lock_conflicts_total')}`,

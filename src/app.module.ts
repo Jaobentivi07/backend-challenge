@@ -2,14 +2,14 @@ import { Module } from '@nestjs/common';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import config from '../mikro-orm.config';
 import { HealthController } from './health.controller';
-import { FinancialController } from './financial.controller';
-import { OutboxPublisher } from './messaging/outbox-publisher';
-import { TransactionConsumer } from './messaging/transaction-consumer';
-import { ReferenceScheduler } from './messaging/reference-scheduler';
+import { ControladorFinanceiro } from './financial.controller';
+import { PublicadorDaOutbox } from './messaging/outbox-publisher';
+import { ConsumidorDeTransacoes } from './messaging/transaction-consumer';
+import { AgendadorDeReferencias } from './messaging/reference-scheduler';
 
 @Module({
   imports: [MikroOrmModule.forRoot({ ...config, registerRequestContext: false })],
-  controllers: [HealthController, FinancialController],
-  providers: [OutboxPublisher, TransactionConsumer, ReferenceScheduler],
+  controllers: [HealthController, ControladorFinanceiro],
+  providers: [PublicadorDaOutbox, ConsumidorDeTransacoes, AgendadorDeReferencias],
 })
 export class AppModule {}

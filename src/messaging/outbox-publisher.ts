@@ -16,8 +16,8 @@ type OutboxRow = {
 };
 
 @Injectable()
-export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(OutboxPublisher.name);
+export class PublicadorDaOutbox implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(PublicadorDaOutbox.name);
   private readonly queueUrl = process.env.SQS_EVENTS_QUEUE_URL;
   private readonly client = new SQSClient({
     region: process.env.SQS_REGION ?? 'us-east-1',
@@ -32,7 +32,7 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
 
   constructor(@Inject(MikroORM) private readonly orm: MikroORM) {}
 
-  async checkReady(): Promise<void> {
+  async verificarProntidao(): Promise<void> {
     if (!this.queueUrl) throw new Error('SQS_EVENTS_QUEUE_URL is unset');
     await this.client.send(new GetQueueAttributesCommand({ QueueUrl: this.queueUrl, AttributeNames: ['QueueArn'] }));
   }
@@ -42,8 +42,8 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
       this.logger.warn('SQS_EVENTS_QUEUE_URL is unset; outbox publisher is disabled');
       return;
     }
-    this.timer = setInterval(() => void this.publishBatch(), 1000);
-    void this.publishBatch();
+    this.timer = setInterval(() => void this.publicarLoteDeEventos(), 1000);
+    void this.publicarLoteDeEventos();
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -53,12 +53,12 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
     this.client.destroy();
   }
 
-  private async publishBatch(): Promise<void> {
+  private async publicarLoteDeEventos(): Promise<void> {
     if (this.publishing || this.stopping || !this.queueUrl) return;
     this.publishing = true;
     try {
-      const lease = randomUUID();
-      const rows = await this.orm.em.transactional(async (em) => em.getConnection().execute<OutboxRow[]>(`
+      const tokenDeLocacao = randomUUID();
+      const eventosReservados = await this.orm.em.transactional(async (gerenteTransacional) => gerenteTransacional.execute<OutboxRow[]>(`
         with picked as (
           select candidate.id from outbox_message candidate
           where candidate.published_at is null
@@ -78,11 +78,11 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
         set lease_token = ?, lease_until = now() + interval '30 seconds', attempts = event.attempts + 1
         from picked where event.id = picked.id
         returning event.id, event.aggregate_id, event.event_type, event.payload, event.occurred_at, event.correlation_id, event.causation_id, event.attempts
-      `, [lease]));
+      `, [tokenDeLocacao]));
 
-      for (const event of rows) {
+      for (const event of eventosReservados) {
         try {
-          const body = JSON.stringify({
+          const corpoDaMensagem = JSON.stringify({
             eventId: event.id,
             eventType: event.event_type,
             aggregateId: event.aggregate_id,
@@ -94,15 +94,15 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
           });
           await this.client.send(new SendMessageCommand({
             QueueUrl: this.queueUrl,
-            MessageBody: body,
+            MessageBody: corpoDaMensagem,
             MessageGroupId: event.aggregate_id,
             MessageDeduplicationId: event.id,
           }));
-          await this.orm.em.getConnection().execute(`update outbox_message set published_at=now(),lease_token=null,lease_until=null where id=? and lease_token=?`, [event.id, lease]);
+          await this.orm.em.getConnection().execute(`update outbox_message set published_at=now(),lease_token=null,lease_until=null where id=? and lease_token=?`, [event.id, tokenDeLocacao]);
         } catch (error) {
           incrementMetric('outbox_retries_total');
           const delaySeconds = Math.min(300, 2 ** Math.min(Number(event.attempts), 8));
-          await this.orm.em.getConnection().execute(`update outbox_message set next_attempt_at=now()+(? * interval '1 second'),lease_token=null,lease_until=null where id=? and lease_token=?`, [delaySeconds,event.id,lease]);
+          await this.orm.em.getConnection().execute(`update outbox_message set next_attempt_at=now()+(? * interval '1 second'),lease_token=null,lease_until=null where id=? and lease_token=?`, [delaySeconds,event.id,tokenDeLocacao]);
           this.logger.warn(JSON.stringify({ event: 'outbox_publish_retry', correlationId: event.id, messageId: null, transactionId: null, walletId: event.aggregate_id, eventId: event.id, error: error instanceof Error ? error.message : 'unknown' }));
         }
       }
