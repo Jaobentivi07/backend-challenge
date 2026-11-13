@@ -45,27 +45,11 @@ Regras já protegidas no schema:
 - Transição terminal de status bloqueada e consistência de cardinalidade/valores entre transaction e ledger.
 - Idempotency payload hash SHA-256 de JSON canônico; `Idempotency-Key` fica fora do hash e precisa coincidir com a chave no envelope SQS.
 
-## Comparação: fork tcalgarotto/backend-challenge
-
-Referências consultadas: [repositório e README](https://github.com/tcalgarotto/backend-challenge) e [ARCHITECTURE.md no branch `delivery`](https://github.com/tcalgarotto/backend-challenge/blob/delivery/ARCHITECTURE.md). O projeto declara Bun, NestJS, MikroORM, PostgreSQL, LocalStack/SQS FIFO, três réplicas, workers, migrations, testes e evidências de carga. O README mapeia explicitamente requisitos para componentes e testes; a arquitetura descreve transações, locks, inbox/outbox, scheduler, leases e constraints.
-
 ### O que vale adotar como referência
 
-- Um único caso de uso de wager compartilhado por HTTP, SQS e scheduler, com adapters fora do domínio.
 - Locks por carteira, além de constraints no PostgreSQL; o broker não é a garantia financeira.
-- Inbox e outbox na transação financeira, ack apenas depois do commit e publisher recuperável após crash.
 - Snapshots idempotentes, referências com prazo/backoff e evidência de testes contra PostgreSQL/SQS reais.
 - ADRs e matriz requisito → implementação → teste. Isso facilita revisão e torna trade-offs verificáveis.
-
-### Risco de domínio observado, não defeito confirmado
-
-O fork declara `per_type` como política padrão: uma referência pode receber um `REFUND` e um `ROLLBACK`, embora não possa receber dois do mesmo tipo. O próprio README mostra o caso em que ambos revertem a mesma BET e o saldo recebe o crédito duas vezes; também oferece `per_reference` para impedir isso. A regra literal do desafio proíbe repetição do mesmo tipo, então `per_type` é uma interpretação possível, mas pode divergir da expectativa operacional de um provedor. Para este serviço, manteremos inicialmente a regra do enunciado e registraremos a semântica como decisão explícita antes de permitir `REFUND` e `ROLLBACK` combinados.
-
-O fork também fixa `LOSS` em `0.00` e sem referência. Como o enunciado define LOSS como resultado sem movimento monetário, adotamos essa interpretação nesta base. As métricas e resultados de testes de carga citados pelo fork são declarações do próprio repositório; não foram reproduzidos independentemente aqui.
-
-### Limite da comparação
-
-Foi possível analisar README, arquitetura e estrutura declarada do fork; não fiz auditoria linha a linha nem executei o fork. Portanto não atribuo bugs de implementação aos autores. A principal oportunidade para nosso projeto é reduzir o atual hiato de escopo e provar suas garantias com a mesma disciplina documental e testes reais.
 
 ## Execução local
 
