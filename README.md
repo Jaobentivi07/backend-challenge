@@ -157,7 +157,7 @@ O benchmark compara o publisher sequencial anterior com o publisher em lotes usa
 
 ## Limitações conhecidas
 
-- Os testes cobrem regras financeiras em múltiplos processos, inbox/redelivery após falha injetada no ACK, encaminhamento manual à DLQ e retry de visibilidade no LocalStack, referências fora de ordem, paginação do ledger e publisher real. Ainda faltam indisponibilidade real de rede/SQS, queda abrupta do processo com reinício e redrive automático após o limite de recebimentos.
+- Os testes cobrem regras financeiras em múltiplos processos, recuperação após `SIGKILL` entre commit e ACK, encaminhamento à DLQ, retry de visibilidade e redrive automático no LocalStack, referências fora de ordem, paginação do ledger e publisher real. Ainda falta testar uma indisponibilidade real de rede entre o serviço e o SQS.
 - Esta aplicação publica eventos, mas não inclui consumidores downstream. Cada consumidor precisa deduplicar duravelmente por `eventId` numa inbox própria, gravada na mesma transação que seus efeitos. O FIFO do SQS sozinho não oferece deduplicação durável.
 - Os contadores de replay, retry de SQS e conflito de lock são locais a cada processo; os demais gauges são calculados com dados persistidos no PostgreSQL/SQS.
 - O consumer SQS processa sequencialmente as mensagens recebidas; a vazão ainda não foi medida.

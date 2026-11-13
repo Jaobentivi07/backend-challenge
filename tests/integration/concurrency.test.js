@@ -364,4 +364,111 @@ describe('Integração PostgreSQL e concorrência entre processos', () => {
       else process.env.SQS_TRANSACTIONS_DLQ_URL = envAnterior.filaDeErros;
     }
   }, 30_000);
+
+  test('processo encerrado após commit reinicia e confirma redelivery sem novo débito', async () => {
+    const endpointSqs = process.env.SQS_ENDPOINT_URL;
+    if (!endpointSqs) throw new Error('Defina SQS_ENDPOINT_URL para testar recuperação após queda do consumidor.');
+    const clienteSqsDeTeste = new SQSClient({
+      region: process.env.SQS_REGION ?? 'us-east-1',
+      endpoint: endpointSqs,
+      credentials: {
+        accessKeyId: process.env.SQS_ACCESS_KEY ?? 'test',
+        secretAccessKey: process.env.SQS_SECRET_KEY ?? 'test',
+      },
+    });
+    const ambienteAnterior = {
+      porta: process.env.PORT,
+      filaPrincipal: process.env.SQS_TRANSACTIONS_QUEUE_URL,
+      filaDeErros: process.env.SQS_TRANSACTIONS_DLQ_URL,
+    };
+    const sufixoDaFila = randomUUID().slice(0, 8);
+    let urlDaFilaPrincipal;
+    let urlDaFilaDeErros;
+
+    try {
+      const filaPrincipalCriada = await clienteSqsDeTeste.send(new CreateQueueCommand({
+        QueueName: `consumer-crash-${sufixoDaFila}.fifo`,
+        Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false' },
+      }));
+      const filaDeErrosCriada = await clienteSqsDeTeste.send(new CreateQueueCommand({
+        QueueName: `consumer-crash-dlq-${sufixoDaFila}.fifo`,
+        Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false' },
+      }));
+      urlDaFilaPrincipal = `${endpointSqs.replace(/\/$/, '')}${new URL(filaPrincipalCriada.QueueUrl).pathname}`;
+      urlDaFilaDeErros = `${endpointSqs.replace(/\/$/, '')}${new URL(filaDeErrosCriada.QueueUrl).pathname}`;
+      process.env.PORT = '3311';
+      process.env.SQS_TRANSACTIONS_QUEUE_URL = urlDaFilaPrincipal;
+      process.env.SQS_TRANSACTIONS_DLQ_URL = urlDaFilaDeErros;
+
+      const carteira = await createWallet();
+      const aposta = wager(carteira, { externalId: randomUUID(), amount: '14.00' });
+      const envelope = {
+        messageId: randomUUID(),
+        type: 'WagerTransactionRequested',
+        data: { ...aposta, idempotencyKey: `integration:${aposta.externalTransactionId}` },
+      };
+      await clienteSqsDeTeste.send(new SendMessageCommand({
+        QueueUrl: urlDaFilaPrincipal,
+        MessageBody: JSON.stringify(envelope),
+        MessageGroupId: carteira.id,
+        MessageDeduplicationId: envelope.messageId,
+      }));
+
+      const ambienteDoWorker = {
+        ...process.env,
+        PORT: '3311',
+        SIMULAR_QUEDA_APOS_COMMIT: 'true',
+      };
+      const trabalhadorEncerrado = spawn(process.execPath, ['tests/integration/helpers/consumidor-uma-mensagem.js'], {
+        cwd: process.cwd(),
+        env: ambienteDoWorker,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const resultadoDaQueda = await once(trabalhadorEncerrado, 'close');
+      expect(resultadoDaQueda[1]).toBe('SIGKILL');
+      expect((await request(0, `/wallets/${carteira.id}`)).body.balance.amount).toBe('86.00');
+
+      const ambienteDoWorkerSubstituto = { ...process.env, PORT: '3311' };
+      delete ambienteDoWorkerSubstituto.SIMULAR_QUEDA_APOS_COMMIT;
+      const trabalhadorSubstituto = spawn(process.execPath, ['tests/integration/helpers/consumidor-uma-mensagem.js'], {
+        cwd: process.cwd(),
+        env: ambienteDoWorkerSubstituto,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const resultadoDaRecuperacao = await once(trabalhadorSubstituto, 'close');
+      expect(resultadoDaRecuperacao[0]).toBe(0);
+
+      const ormDeVerificacao = await MikroORM.init((await import('../../dist/mikro-orm.config.js')).default);
+      try {
+        const [transacoesDaAposta] = await ormDeVerificacao.em.getConnection().execute(
+          'select count(*)::int as quantidade from wager_transaction where provider_id=? and external_transaction_id=?',
+          [aposta.providerId, aposta.externalTransactionId],
+        );
+        const [debitosDaCarteira] = await ormDeVerificacao.em.getConnection().execute(
+          'select count(*)::int as quantidade from wallet_ledger_entry where wallet_id=? and direction=\'DEBIT\'',
+          [carteira.id],
+        );
+        const [mensagemDaInbox] = await ormDeVerificacao.em.getConnection().execute(
+          'select processed_at from inbox_message where consumer_name=? and message_id=?',
+          ['wager-transactions', envelope.messageId],
+        );
+        expect(transacoesDaAposta.quantidade).toBe(1);
+        expect(debitosDaCarteira.quantidade).toBe(1);
+        expect(mensagemDaInbox.processed_at).not.toBeNull();
+      } finally {
+        await ormDeVerificacao.close(true);
+      }
+      expect((await request(2, `/wallets/${carteira.id}/reconciliation`, { method: 'POST', body: '{}' })).body.consistent).toBe(true);
+    } finally {
+      if (urlDaFilaPrincipal) await clienteSqsDeTeste.send(new DeleteQueueCommand({ QueueUrl: urlDaFilaPrincipal })).catch(() => {});
+      if (urlDaFilaDeErros) await clienteSqsDeTeste.send(new DeleteQueueCommand({ QueueUrl: urlDaFilaDeErros })).catch(() => {});
+      clienteSqsDeTeste.destroy();
+      if (ambienteAnterior.porta === undefined) delete process.env.PORT;
+      else process.env.PORT = ambienteAnterior.porta;
+      if (ambienteAnterior.filaPrincipal === undefined) delete process.env.SQS_TRANSACTIONS_QUEUE_URL;
+      else process.env.SQS_TRANSACTIONS_QUEUE_URL = ambienteAnterior.filaPrincipal;
+      if (ambienteAnterior.filaDeErros === undefined) delete process.env.SQS_TRANSACTIONS_DLQ_URL;
+      else process.env.SQS_TRANSACTIONS_DLQ_URL = ambienteAnterior.filaDeErros;
+    }
+  }, 30_000);
 });

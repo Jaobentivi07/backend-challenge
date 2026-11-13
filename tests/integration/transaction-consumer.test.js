@@ -4,6 +4,7 @@ import {
   CreateQueueCommand,
   DeleteMessageCommand,
   DeleteQueueCommand,
+  GetQueueAttributesCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
@@ -111,4 +112,79 @@ test('encaminha envelope inválido à DLQ real e torna a mensagem visível após
   expect(JSON.parse(mensagemRecuperada.Body)).toEqual(envelopeDaTransacao);
   expect(mensagemRecuperada.Attributes.ApproximateReceiveCount).toBe('2');
   await clienteDeTeste.send(new DeleteMessageCommand({ QueueUrl: filaDeEntrada, ReceiptHandle: mensagemRecuperada.ReceiptHandle }));
+});
+
+test('a fila FIFO move para a DLQ após exceder o limite automático de recebimentos', async () => {
+  if (!endpointSqs) throw new Error('Defina SQS_ENDPOINT_URL para executar os testes com LocalStack.');
+  if (!clienteDeTeste) {
+    clienteDeTeste = new SQSClient({
+      region: process.env.SQS_REGION ?? 'us-east-1',
+      endpoint: endpointSqs,
+      credentials: {
+        accessKeyId: process.env.SQS_ACCESS_KEY ?? 'test',
+        secretAccessKey: process.env.SQS_SECRET_KEY ?? 'test',
+      },
+    });
+  }
+
+  const sufixoDaFila = randomUUID().slice(0, 8);
+  let urlDaFilaDeOrigem;
+  let urlDaFilaDeRedrive;
+  try {
+    const filaDeRedriveCriada = await clienteDeTeste.send(new CreateQueueCommand({
+      QueueName: `redrive-target-${sufixoDaFila}.fifo`,
+      Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false' },
+    }));
+    urlDaFilaDeRedrive = `${endpointSqs.replace(/\/$/, '')}${new URL(filaDeRedriveCriada.QueueUrl).pathname}`;
+    const atributosDaFilaDeRedrive = await clienteDeTeste.send(new GetQueueAttributesCommand({
+      QueueUrl: urlDaFilaDeRedrive,
+      AttributeNames: ['QueueArn'],
+    }));
+    const filaDeOrigemCriada = await clienteDeTeste.send(new CreateQueueCommand({
+      QueueName: `redrive-source-${sufixoDaFila}.fifo`,
+      Attributes: {
+        FifoQueue: 'true',
+        ContentBasedDeduplication: 'false',
+        RedrivePolicy: JSON.stringify({
+          deadLetterTargetArn: atributosDaFilaDeRedrive.Attributes.QueueArn,
+          maxReceiveCount: '2',
+        }),
+      },
+    }));
+    urlDaFilaDeOrigem = `${endpointSqs.replace(/\/$/, '')}${new URL(filaDeOrigemCriada.QueueUrl).pathname}`;
+    const identificadorDaMensagem = randomUUID();
+    await clienteDeTeste.send(new SendMessageCommand({
+      QueueUrl: urlDaFilaDeOrigem,
+      MessageBody: JSON.stringify({ evento: 'falha persistente' }),
+      MessageGroupId: 'grupo-redrive',
+      MessageDeduplicationId: identificadorDaMensagem,
+    }));
+
+    let mensagemRedirecionada;
+    for (let recebimento = 0; recebimento < 6 && !mensagemRedirecionada; recebimento++) {
+      await clienteDeTeste.send(new ReceiveMessageCommand({
+        QueueUrl: urlDaFilaDeOrigem,
+        MaxNumberOfMessages: 1,
+        WaitTimeSeconds: 1,
+        VisibilityTimeout: 0,
+        MessageSystemAttributeNames: ['ApproximateReceiveCount'],
+      }));
+      const mensagensNaDlq = await clienteDeTeste.send(new ReceiveMessageCommand({
+        QueueUrl: urlDaFilaDeRedrive,
+        MaxNumberOfMessages: 1,
+        WaitTimeSeconds: 1,
+      }));
+      mensagemRedirecionada = mensagensNaDlq.Messages?.[0];
+    }
+
+    expect(mensagemRedirecionada).toBeTruthy();
+    expect(JSON.parse(mensagemRedirecionada.Body)).toEqual({ evento: 'falha persistente' });
+    await clienteDeTeste.send(new DeleteMessageCommand({
+      QueueUrl: urlDaFilaDeRedrive,
+      ReceiptHandle: mensagemRedirecionada.ReceiptHandle,
+    }));
+  } finally {
+    if (urlDaFilaDeOrigem) await clienteDeTeste.send(new DeleteQueueCommand({ QueueUrl: urlDaFilaDeOrigem })).catch(() => {});
+    if (urlDaFilaDeRedrive) await clienteDeTeste.send(new DeleteQueueCommand({ QueueUrl: urlDaFilaDeRedrive })).catch(() => {});
+  }
 });

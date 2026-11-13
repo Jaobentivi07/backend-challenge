@@ -17,7 +17,7 @@
 
 ## Limitações restantes
 
-- Os testes de integração agora cobrem DLQ manual e retry de visibilidade no LocalStack, além de redelivery após falha injetada no ACK posterior ao commit. Ainda faltam indisponibilidade real de rede/SQS, queda abrupta do processo com reinício e redrive automático após o limite de recebimentos.
+- Os testes de integração cobrem falha com `SIGKILL` após o commit, recuperação por um consumidor substituto, DLQ manual, retry de visibilidade e redrive automático no LocalStack. Ainda falta testar uma indisponibilidade real de rede entre o serviço e o SQS.
 - Este repositório não contém consumidores downstream da fila de eventos. Cada consumidor precisa de uma inbox própria com unicidade por `eventId`, confirmada atomicamente com os efeitos, pois a deduplicação FIFO do SQS tem duração limitada.
 - Métricas de replay, retry SQS e conflitos de lock são contadores em memória por processo; os status, tentativas do scheduler/outbox, latência e lag são lidos do banco. Use Prometheus para coletar cada instância e agregue os contadores localmente.
 - A entrada SQS ainda faz loopback HTTP para reutilizar a rota de wager; worker e API são co-localizados no processo/container. O fluxo de referência pendente continua no scheduler próprio e ainda não usa o novo processador compartilhado.
@@ -33,7 +33,7 @@
 
 ## Situação atual e prioridades
 
-Estado em 13/11/2026: migrations 20261112000000 a 20261115000000 aplicam o schema financeiro, inbox/outbox, agendamento de referência, envelope de correlação e triggers deferred. Build e testes passaram nesta revisão: 14 testes Node, 3 testes Bun de `Money` e 9 testes de integração com PostgreSQL/LocalStack. Os casos de indisponibilidade real de rede e queda abrupta do processo continuam pendentes. Isso não substitui uma validação em infraestrutura de produção.
+Estado em 13/11/2026: migrations 20261112000000 a 20261115000000 aplicam o schema financeiro, inbox/outbox, agendamento de referência, envelope de correlação e triggers deferred. Build e testes passaram nesta revisão: 14 testes Node, 3 testes Bun de `Money` e 13 testes de integração com PostgreSQL/LocalStack, com 79 verificações. A indisponibilidade real de rede entre o serviço e o SQS continua sem teste. Isso não substitui uma validação em infraestrutura de produção.
 
 Regras já protegidas no schema:
 
